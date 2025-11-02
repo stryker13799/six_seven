@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections import deque
+import time
+from dataclasses import dataclass
+from enum import Enum, auto
 from pathlib import Path
 
 import cv2
@@ -20,16 +22,116 @@ if str(SRC_DIR) not in sys.path:
 ONNX_PATH = r"C:\Users\Ali\Desktop\six_seven\artifacts\mobilenet_v3.onnx"
 MEME_IMAGE = r"C:\Users\Ali\Desktop\six_seven\resource\67.jpg"
 MEME_AUDIO = r"C:\Users\Ali\Desktop\six_seven\resource\67.mp3"
-MIN_CONFIDENCE = 0.6
-CONSECUTIVE_FRAMES = 8
+MIN_CONFIDENCE = 0.8
+DEFAULT_MIN_ACTIVE_DURATION = 0.5
+DEFAULT_TOLERANCE_SECONDS = 1.0
+DEFAULT_COOLDOWN_SECONDS = 1.0
+
+
+class DetectionState(Enum):
+    IDLE = auto()
+    DETECTING = auto()
+    ACTIVE = auto()
+    COOLDOWN = auto()
+
+
+@dataclass
+class DetectionStateMachine:
+    min_active_duration: float
+    tolerance_seconds: float
+    cooldown_seconds: float
+    state: DetectionState = DetectionState.IDLE
+    detect_start: float | None = None
+    last_positive: float | None = None
+    active_since: float | None = None
+    cooldown_until: float | None = None
+
+    def reset_detection_window(self) -> None:
+        self.detect_start = None
+        self.last_positive = None
+
+    def update(self, is_positive: bool, now: float | None = None) -> DetectionState:
+        if now is None:
+            now = time.monotonic()
+
+        if self.state is DetectionState.COOLDOWN:
+            if self.cooldown_until is not None and now >= self.cooldown_until:
+                self.state = DetectionState.IDLE
+                self.cooldown_until = None
+                self.active_since = None
+                self.reset_detection_window()
+            else:
+                return self.state
+
+        if self.state is DetectionState.IDLE:
+            if is_positive:
+                self.state = DetectionState.DETECTING
+                self.detect_start = now
+                self.last_positive = now
+            return self.state
+
+        if self.state is DetectionState.DETECTING:
+            if is_positive:
+                self.last_positive = now
+            elif self.last_positive is not None and now - self.last_positive > self.tolerance_seconds:
+                self.state = DetectionState.IDLE
+                self.reset_detection_window()
+                return self.state
+
+            if (
+                self.detect_start is not None
+                and now - self.detect_start >= self.min_active_duration
+                and self.last_positive is not None
+                and now - self.last_positive <= self.tolerance_seconds
+            ):
+                self.state = DetectionState.ACTIVE
+                self.active_since = now
+                return self.state
+
+            return self.state
+
+        if self.state is DetectionState.ACTIVE:
+            if is_positive:
+                self.last_positive = now
+                return self.state
+
+            if self.last_positive is None or now - self.last_positive > self.tolerance_seconds:
+                self.state = DetectionState.COOLDOWN
+                self.cooldown_until = now + self.cooldown_seconds
+                self.reset_detection_window()
+            return self.state
+
+        return self.state
+
+    def detection_elapsed(self, now: float) -> float | None:
+        if self.detect_start is None:
+            return None
+        return now - self.detect_start
+
+    def active_elapsed(self, now: float) -> float | None:
+        if self.active_since is None:
+            return None
+        return now - self.active_since
+
+    def time_since_last_positive(self, now: float) -> float | None:
+        if self.last_positive is None:
+            return None
+        return now - self.last_positive
+
+    def cooldown_remaining(self, now: float) -> float | None:
+        if self.state is not DetectionState.COOLDOWN or self.cooldown_until is None:
+            return None
+        return max(0.0, self.cooldown_until - now)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Live 67 detector demo")
     parser.add_argument("--onnx", type=Path, default=Path(ONNX_PATH))
-    parser.add_argument("--camera-index", type=int, default=0)
+    parser.add_argument("--camera_index", type=int, default=0)
     parser.add_argument("--threshold", type=float, default=MIN_CONFIDENCE)
-    parser.add_argument("--consecutive", type=int, default=CONSECUTIVE_FRAMES)
+    parser.add_argument("--min_active_duration", type=float, default=DEFAULT_MIN_ACTIVE_DURATION)
+    parser.add_argument("--tolerance", type=float, default=DEFAULT_TOLERANCE_SECONDS)
+    parser.add_argument("--cooldown", type=float, default=DEFAULT_COOLDOWN_SECONDS)
     parser.add_argument("--mirror", action="store_true")
     return parser.parse_args()
 
@@ -68,12 +170,16 @@ def main() -> None:
     eval_tf = weights.transforms()
     
     pygame.mixer.init()
-    meme_img = None
-    if Path(MEME_IMAGE).exists():
-        meme_img = cv2.imread(MEME_IMAGE)
-    
-    detection_buffer = deque(maxlen=args.consecutive)
-    is_67_active = False
+    meme_img = cv2.imread(MEME_IMAGE) if Path(MEME_IMAGE).exists() else None
+    meme_audio_path = Path(MEME_AUDIO)
+    audio_available = meme_audio_path.exists()
+
+    state_machine = DetectionStateMachine(
+        min_active_duration=max(0.0, args.min_active_duration),
+        tolerance_seconds=max(0.0, args.tolerance),
+        cooldown_seconds=max(0.0, args.cooldown),
+    )
+    prev_state = state_machine.state
     
     cap = cv2.VideoCapture(args.camera_index)
     if not cap.isOpened():
@@ -94,23 +200,22 @@ def main() -> None:
             positive_prob = float(probs[0, 1])
             
             is_67_frame = positive_prob >= args.threshold
-            detection_buffer.append(is_67_frame)
-            
-            sequence_detected = len(detection_buffer) == args.consecutive and all(detection_buffer)
-            
-            if sequence_detected and not is_67_active:
-                is_67_active = True
-                if Path(MEME_AUDIO).exists():
-                    try:
-                        pygame.mixer.music.load(MEME_AUDIO)
-                        pygame.mixer.music.play(-1)
-                    except:
-                        pass
-            elif not sequence_detected and is_67_active:
-                is_67_active = False
-                pygame.mixer.music.stop()
-            
-            if is_67_active and meme_img is not None:
+            now = time.monotonic()
+            state = state_machine.update(is_67_frame, now)
+
+            if prev_state != state:
+                if state is DetectionState.ACTIVE:
+                    if audio_available:
+                        try:
+                            pygame.mixer.music.load(str(meme_audio_path))
+                            pygame.mixer.music.play(-1)
+                        except pygame.error:
+                            pass
+                elif prev_state is DetectionState.ACTIVE:
+                    pygame.mixer.music.stop()
+                prev_state = state
+
+            if state is DetectionState.ACTIVE and meme_img is not None:
                 h, w = frame.shape[:2]
                 meme_resized = cv2.resize(meme_img, (w, h))
                 alpha = 0.7
@@ -118,12 +223,74 @@ def main() -> None:
                 
                 frame = cv2.convertScaleAbs(frame, alpha=1.3, beta=30)
             
-            color = (0, 255, 0) if is_67_active else ((255, 165, 0) if is_67_frame else (0, 0, 255))
-            status = "67 DETECTED" if is_67_active else ("detecting..." if is_67_frame else "waiting")
-            
-            cv2.putText(frame, status, (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+            status_colors = {
+                DetectionState.IDLE: (0, 0, 255),
+                DetectionState.DETECTING: (255, 165, 0),
+                DetectionState.ACTIVE: (0, 255, 0),
+                DetectionState.COOLDOWN: (128, 0, 128),
+            }
+            status_labels = {
+                DetectionState.IDLE: "waiting",
+                DetectionState.DETECTING: "arming",
+                DetectionState.ACTIVE: "67 detected",
+                DetectionState.COOLDOWN: "cooldown",
+            }
+
+            color = status_colors[state]
+            cv2.putText(frame, status_labels[state], (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
             cv2.putText(frame, f"conf: {positive_prob:.2f}", (12, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(frame, f"buffer: {sum(detection_buffer)}/{len(detection_buffer)}", (12, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+            line_y = 110
+            if state is DetectionState.DETECTING:
+                arming_elapsed = state_machine.detection_elapsed(now) or 0.0
+                cv2.putText(
+                    frame,
+                    f"arming: {arming_elapsed:.2f}/{state_machine.min_active_duration:.2f}s",
+                    (12, line_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (200, 200, 200),
+                    1,
+                )
+                line_y += 30
+            elif state is DetectionState.ACTIVE:
+                active_elapsed = state_machine.active_elapsed(now) or 0.0
+                cv2.putText(
+                    frame,
+                    f"active: {active_elapsed:.2f}s",
+                    (12, line_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (200, 200, 200),
+                    1,
+                )
+                line_y += 30
+            elif state is DetectionState.COOLDOWN:
+                cooldown_remaining = state_machine.cooldown_remaining(now) or 0.0
+                cv2.putText(
+                    frame,
+                    f"cooldown: {cooldown_remaining:.2f}s",
+                    (12, line_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (200, 200, 200),
+                    1,
+                )
+                line_y += 30
+
+            if state in (DetectionState.DETECTING, DetectionState.ACTIVE) and state_machine.tolerance_seconds > 0:
+                since_positive = state_machine.time_since_last_positive(now)
+                if since_positive is not None:
+                    tolerance_left = max(0.0, state_machine.tolerance_seconds - since_positive)
+                    cv2.putText(
+                        frame,
+                        f"tolerance left: {tolerance_left:.2f}s",
+                        (12, line_y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (160, 160, 160),
+                        1,
+                    )
             
             cv2.imshow("67 live", frame)
             key = cv2.waitKey(1) & 0xFF
