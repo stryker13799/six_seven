@@ -160,20 +160,92 @@ def softmax_np(x: np.ndarray) -> np.ndarray:
     return e / np.sum(e, axis=1, keepdims=True)
 
 
+def initialize_components(args):
+    session, input_name = load_onnx_session(args.onnx)
+    weights = MobileNet_V3_Small_Weights.DEFAULT
+    eval_tf = weights.transforms()
+    pygame.mixer.init()
+    meme_img = cv2.imread(MEME_IMAGE) if Path(MEME_IMAGE).exists() else None
+    meme_audio_path = Path(MEME_AUDIO)
+    audio_available = meme_audio_path.exists()
+    return session, input_name, eval_tf, meme_img, audio_available, meme_audio_path
+
+
+def process_frame(frame, session, input_name, eval_tf):
+    ort_input = preprocess_frame(frame, eval_tf)
+    logits = session.run(None, {input_name: ort_input})[0]
+    probs = softmax_np(logits)
+    positive_prob = float(probs[0, 1])
+    return positive_prob
+
+
+def handle_state_change(prev_state, state, audio_available, meme_audio_path):
+    if prev_state != state:
+        if state is DetectionState.ACTIVE:
+            if audio_available:
+                pygame.mixer.music.load(str(meme_audio_path))
+                pygame.mixer.music.play(-1)
+        elif prev_state is DetectionState.ACTIVE:
+            pygame.mixer.music.stop()
+        return state
+    return prev_state
+
+
+def update_frame(frame, state, positive_prob, state_machine, now, meme_img):
+    if state is DetectionState.ACTIVE and meme_img is not None:
+        h, w = frame.shape[:2]
+        meme_resized = cv2.resize(meme_img, (w, h))
+        alpha = 0.7
+        frame = cv2.addWeighted(frame, 1 - alpha, meme_resized, alpha, 0)
+        frame = cv2.convertScaleAbs(frame, alpha=1.3, beta=30)
+    
+    status_colors = {
+        DetectionState.IDLE: (0, 0, 255),
+        DetectionState.DETECTING: (255, 165, 0),
+        DetectionState.ACTIVE: (0, 255, 0),
+        DetectionState.COOLDOWN: (128, 0, 128),
+    }
+    status_labels = {
+        DetectionState.IDLE: "waiting",
+        DetectionState.DETECTING: "arming",
+        DetectionState.ACTIVE: "67 detected",
+        DetectionState.COOLDOWN: "cooldown",
+    }
+
+    color = status_colors[state]
+    cv2.putText(frame, status_labels[state], (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+    cv2.putText(frame, f"conf: {positive_prob:.2f}", (12, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    line_y = 110
+    if state is DetectionState.DETECTING:
+        arming_elapsed = state_machine.detection_elapsed(now) or 0.0
+        cv2.putText(frame, f"arming: {arming_elapsed:.2f}/{state_machine.min_active_duration:.2f}s", (12, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        line_y += 30
+    elif state is DetectionState.ACTIVE:
+        active_elapsed = state_machine.active_elapsed(now) or 0.0
+        cv2.putText(frame, f"active: {active_elapsed:.2f}s", (12, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        line_y += 30
+    elif state is DetectionState.COOLDOWN:
+        cooldown_remaining = state_machine.cooldown_remaining(now) or 0.0
+        cv2.putText(frame, f"cooldown: {cooldown_remaining:.2f}s", (12, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        line_y += 30
+
+    if state in (DetectionState.DETECTING, DetectionState.ACTIVE) and state_machine.tolerance_seconds > 0:
+        since_positive = state_machine.time_since_last_positive(now)
+        if since_positive is not None:
+            tolerance_left = max(0.0, state_machine.tolerance_seconds - since_positive)
+            cv2.putText(frame, f"tolerance left: {tolerance_left:.2f}s", (12, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (160, 160, 160), 1)
+    
+    return frame
+
+
 def main() -> None:
     args = parse_args()
     if not args.onnx.exists():
         raise FileNotFoundError(f"missing onnx model: {args.onnx}")
     
-    session, input_name = load_onnx_session(args.onnx)
-    weights = MobileNet_V3_Small_Weights.DEFAULT
-    eval_tf = weights.transforms()
+    session, input_name, eval_tf, meme_img, audio_available, meme_audio_path = initialize_components(args)
     
-    pygame.mixer.init()
-    meme_img = cv2.imread(MEME_IMAGE) if Path(MEME_IMAGE).exists() else None
-    meme_audio_path = Path(MEME_AUDIO)
-    audio_available = meme_audio_path.exists()
-
     state_machine = DetectionStateMachine(
         min_active_duration=max(0.0, args.min_active_duration),
         tolerance_seconds=max(0.0, args.tolerance),
@@ -194,103 +266,15 @@ def main() -> None:
             if args.mirror:
                 frame = cv2.flip(frame, 1)
             
-            ort_input = preprocess_frame(frame, eval_tf)
-            logits = session.run(None, {input_name: ort_input})[0]
-            probs = softmax_np(logits)
-            positive_prob = float(probs[0, 1])
+            positive_prob = process_frame(frame, session, input_name, eval_tf)
             
             is_67_frame = positive_prob >= args.threshold
             now = time.monotonic()
             state = state_machine.update(is_67_frame, now)
-
-            if prev_state != state:
-                if state is DetectionState.ACTIVE:
-                    if audio_available:
-                        try:
-                            pygame.mixer.music.load(str(meme_audio_path))
-                            pygame.mixer.music.play(-1)
-                        except pygame.error:
-                            pass
-                elif prev_state is DetectionState.ACTIVE:
-                    pygame.mixer.music.stop()
-                prev_state = state
-
-            if state is DetectionState.ACTIVE and meme_img is not None:
-                h, w = frame.shape[:2]
-                meme_resized = cv2.resize(meme_img, (w, h))
-                alpha = 0.7
-                frame = cv2.addWeighted(frame, 1 - alpha, meme_resized, alpha, 0)
-                
-                frame = cv2.convertScaleAbs(frame, alpha=1.3, beta=30)
             
-            status_colors = {
-                DetectionState.IDLE: (0, 0, 255),
-                DetectionState.DETECTING: (255, 165, 0),
-                DetectionState.ACTIVE: (0, 255, 0),
-                DetectionState.COOLDOWN: (128, 0, 128),
-            }
-            status_labels = {
-                DetectionState.IDLE: "waiting",
-                DetectionState.DETECTING: "arming",
-                DetectionState.ACTIVE: "67 detected",
-                DetectionState.COOLDOWN: "cooldown",
-            }
-
-            color = status_colors[state]
-            cv2.putText(frame, status_labels[state], (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
-            cv2.putText(frame, f"conf: {positive_prob:.2f}", (12, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-            line_y = 110
-            if state is DetectionState.DETECTING:
-                arming_elapsed = state_machine.detection_elapsed(now) or 0.0
-                cv2.putText(
-                    frame,
-                    f"arming: {arming_elapsed:.2f}/{state_machine.min_active_duration:.2f}s",
-                    (12, line_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (200, 200, 200),
-                    1,
-                )
-                line_y += 30
-            elif state is DetectionState.ACTIVE:
-                active_elapsed = state_machine.active_elapsed(now) or 0.0
-                cv2.putText(
-                    frame,
-                    f"active: {active_elapsed:.2f}s",
-                    (12, line_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (200, 200, 200),
-                    1,
-                )
-                line_y += 30
-            elif state is DetectionState.COOLDOWN:
-                cooldown_remaining = state_machine.cooldown_remaining(now) or 0.0
-                cv2.putText(
-                    frame,
-                    f"cooldown: {cooldown_remaining:.2f}s",
-                    (12, line_y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (200, 200, 200),
-                    1,
-                )
-                line_y += 30
-
-            if state in (DetectionState.DETECTING, DetectionState.ACTIVE) and state_machine.tolerance_seconds > 0:
-                since_positive = state_machine.time_since_last_positive(now)
-                if since_positive is not None:
-                    tolerance_left = max(0.0, state_machine.tolerance_seconds - since_positive)
-                    cv2.putText(
-                        frame,
-                        f"tolerance left: {tolerance_left:.2f}s",
-                        (12, line_y),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (160, 160, 160),
-                        1,
-                    )
+            prev_state = handle_state_change(prev_state, state, audio_available, meme_audio_path)
+            
+            frame = update_frame(frame, state, positive_prob, state_machine, now, meme_img)
             
             cv2.imshow("67 live", frame)
             key = cv2.waitKey(1) & 0xFF
