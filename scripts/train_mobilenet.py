@@ -14,6 +14,7 @@ from torch import nn
 from torch.amp import GradScaler, autocast # pyright: ignore[reportPrivateImportUsage]
 from torch.utils.data import DataLoader
 from torchvision import transforms
+import random
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,7 +60,10 @@ def build_transforms() -> tuple:
     
     train_tf = A.Compose([
         A.RandomResizedCrop(size=(224, 224), scale=(0.8, 1.0)),
-        A.HorizontalFlip(p=0.5),
+        A.HorizontalFlip(p=0.2),
+        A.GaussianBlur(blur_limit=(3, 7), p=0.5),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
+        A.CLAHE(clip_limit=2.0, p=0.3),
         A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.3),
         A.Normalize(mean=mean, std=std),
         ToTensorV2(),
@@ -75,12 +79,27 @@ def build_transforms() -> tuple:
     return train_tf, eval_tf
 
 
+def save_training_examples(images, targets, examples_dir, epoch, batch_idx):
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    for i in range(min(3, len(images))):
+        img = images[i].cpu()
+        img = img * std + mean
+        img = torch.clamp(img, 0, 1)
+        img = transforms.ToPILImage()(img)
+        label = targets[i].item()
+        img.save(examples_dir / f"epoch_{epoch}_batch_{batch_idx}_sample_{i}_label_{label}.png")
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_mobilenet()
     train_tf, eval_tf = build_transforms()
+
+    examples_dir = ROOT / "data" / "training_examples"
+    examples_dir.mkdir(parents=True, exist_ok=True)
 
     splits = create_image_splits(
         args.image_root,
@@ -135,9 +154,13 @@ def main() -> None:
         model.train()
         loss_meter = AverageMeter()
         acc_meter = AverageMeter()
-        for images, targets in train_loader:
+        for batch_idx, (images, targets) in enumerate(train_loader):
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
+
+            if random.random() < 0.1 and epoch < args.epochs // 2: 
+                save_training_examples(images, targets, examples_dir, epoch, batch_idx)
+            
             optimizer.zero_grad()
             with autocast(device_type=device.type, enabled=device.type == "cuda"):
                 logits = model(images)

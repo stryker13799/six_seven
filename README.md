@@ -20,10 +20,36 @@ Captures training data, trains a MobileNetV3 detector, exports to ONNX, and runs
 
 ## training
 
+### Automated Training Pipeline (Recommended)
+
+Use the automated scripts to train and export the model in one command:
+
+**Windows (PowerShell/CMD):**
+```powershell
+.\train_and_export.bat
+```
+
+**Linux/WSL/Git Bash:**
+```bash
+chmod +x train_and_export.sh
+./train_and_export.sh
+```
+
+These scripts will:
+- Train the MobileNetV3 model with default parameters
+- Save the checkpoint to `artifacts/mobilenet_v3.pth`
+- Export the trained model to ONNX format
+- Verify the ONNX export
+- Display progress and summary
+
+To customize training parameters, edit the configuration section at the top of the script.
+
+### Manual Training
+
 MobileNetV3:
 ```powershell
 python scripts\train_mobilenet.py --image-root data\images --epochs 20 --batch-size 32
-python scripts\export_onnx.py --checkpoint artifacts\mobilenet_v3.pth --onnx_path artifacts\mobilenet_v3.onnx
+python scripts\export_onnx.py --checkpoint artifacts\mobilenet_v3.pth --onnx_path artifacts\mobilenet_v3.onnx --verify
 ```
 
 ## live inference
