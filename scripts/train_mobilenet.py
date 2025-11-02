@@ -41,7 +41,7 @@ class AlbumentationsWrapper:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train MobileNetV3 on the 67 dataset")
     parser.add_argument("--image-root", type=Path, default=Path("data/images"))
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--warmup-epochs", type=int, default=1)
